@@ -86,7 +86,7 @@ if file is None:
     st.text("Please upload an image file in jpg or png format")
 else:
     image = Image.open(file)
-    st.image(image, use_column_width=True)
+    st.image(image, use_container_width=True)
     st.caption('_Image Uploaded by_ USER')
     img_array = preprocess_input(get_img_array(path, size=img_size))
     prediction0 = model.predict(img_array)
@@ -121,3 +121,4 @@ else:
     st.markdown('####')
     st.write("Group Website: [Oral Cancer Research Theme, HKU](https://facdent.hku.hk/research/oral-cancer.html)  |  2024")
     
+
