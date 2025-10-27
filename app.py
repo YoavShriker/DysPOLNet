@@ -112,7 +112,7 @@ else:
     st.write('Explainability Heatmap:')
     heatmap = make_gradcam_heatmap(img_array, model, last_conv_layer_name)
     image2=display_gradcam(path, heatmap)
-    st.image(image2, use_column_width=True)
+    st.image(image2, use_container_width=True)
     st.caption('_GradCAM heatmap showing region(s) influencing :blue[DysPOLNet’s] prediction_')
     st.markdown('####')
     st.markdown('####')
@@ -121,4 +121,5 @@ else:
     st.markdown('####')
     st.write("Group Website: [Oral Cancer Research Theme, HKU](https://facdent.hku.hk/research/oral-cancer.html)  |  2024")
     
+
 
