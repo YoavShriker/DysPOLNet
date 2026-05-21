@@ -2,6 +2,8 @@ tensorflow-cpu==2.15.0
 keras==2.15.0
 streamlit>=1.32,<2
 numpy>=1.24,<2
-Pillow>=10,<11
+Pillow>=11,<13
+pillow-heif>=0.18
+pillow-avif-plugin>=1.5
 matplotlib>=3.7,<4
 h5py>=3.10,<4

@@ -12,6 +12,8 @@ sys.path.insert(0, os.path.dirname(HERE))
 from app import (  # noqa: E402
     PLATT_COEF,
     PLATT_INTERCEPT,
+    UnsupportedImageError,
+    decode_uploaded_image,
     find_gap_layer_name,
     make_gradcam_heatmap,
     pil_to_model_input,
@@ -85,3 +87,62 @@ def test_pil_to_model_input_handles_rgba_and_exif():
     assert arr.shape == (1, 300, 300, 3)
     assert arr.dtype == np.float32
     assert arr.min() >= 0.0 and arr.max() <= 255.0
+
+
+def _png_bytes(size=(64, 64), color=(128, 64, 32)):
+    import io
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", size, color).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_decode_accepts_png():
+    img, warn = decode_uploaded_image(_png_bytes())
+    assert img.format == "PNG"
+    assert warn is None
+
+
+def test_decode_rejects_pdf():
+    pdf_bytes = b"%PDF-1.4\n%fake content"
+    with pytest.raises(UnsupportedImageError, match="PDF"):
+        decode_uploaded_image(pdf_bytes)
+
+
+def test_decode_rejects_svg():
+    svg_bytes = b'<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"></svg>'
+    with pytest.raises(UnsupportedImageError, match="SVG"):
+        decode_uploaded_image(svg_bytes)
+
+
+def test_decode_rejects_dicom_magic():
+    fake_dicom = b"\x00" * 128 + b"DICM" + b"\x00" * 100
+    with pytest.raises(UnsupportedImageError, match="DICOM"):
+        decode_uploaded_image(fake_dicom)
+
+
+def test_decode_rejects_garbage():
+    with pytest.raises(UnsupportedImageError):
+        decode_uploaded_image(b"this is definitely not an image")
+
+
+def test_decode_accepts_bmp_and_tiff_and_webp():
+    import io
+    from PIL import Image
+    for fmt in ("BMP", "TIFF", "WEBP"):
+        buf = io.BytesIO()
+        Image.new("RGB", (32, 32), (10, 20, 30)).save(buf, format=fmt)
+        img, warn = decode_uploaded_image(buf.getvalue())
+        assert img.format == fmt
+        assert warn is None
+
+
+def test_decode_multipage_tiff_uses_first_page_with_warning():
+    import io
+    from PIL import Image
+    frames = [Image.new("RGB", (16, 16), (i, i, i)) for i in (50, 100, 150)]
+    buf = io.BytesIO()
+    frames[0].save(buf, format="TIFF", save_all=True, append_images=frames[1:])
+    img, warn = decode_uploaded_image(buf.getvalue())
+    assert img.format == "TIFF"
+    assert warn is not None and "Multi-page" in warn

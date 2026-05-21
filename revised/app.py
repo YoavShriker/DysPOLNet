@@ -8,10 +8,28 @@ import streamlit as st
 import tensorflow as tf
 from PIL import Image, ImageOps
 
+from pillow_heif import register_heif_opener
+
+register_heif_opener()
+try:
+    import pillow_avif  # noqa: F401  # registers AVIF opener on import
+except ImportError:
+    pass
+
+# Cap decoded pixels well below Pillow's default decompression-bomb limit;
+# clinical photographs above 50 megapixels are not expected.
+Image.MAX_IMAGE_PIXELS = 50_000_000
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.environ.get("DYSPOLNET_MODEL", os.path.join(HERE, "..", "DysPOLNet.hdf5"))
 IMG_SIZE = (300, 300)
 OPERATING_THRESHOLD = 0.10
+
+SUPPORTED_UPLOAD_TYPES = [
+    "jpg", "jpeg", "png", "bmp",
+    "tif", "tiff", "webp",
+    "heic", "heif", "avif",
+]
 
 # Platt scaling coefficients from the original `lr` pickle
 # (LogisticRegression: coef_=4.14699105, intercept_=-2.96500325).
@@ -21,6 +39,55 @@ PLATT_INTERCEPT = -2.96500325
 
 def platt_calibrate(raw_score):
     return 1.0 / (1.0 + np.exp(-(PLATT_COEF * raw_score + PLATT_INTERCEPT)))
+
+
+class UnsupportedImageError(ValueError):
+    pass
+
+
+def decode_uploaded_image(file_bytes):
+    # Magic-byte rejections before handing to Pillow, so an extension-renamed
+    # file (foo.pdf -> foo.jpg) gets a useful error instead of a decode crash.
+    if file_bytes[:5] == b"%PDF-":
+        raise UnsupportedImageError(
+            "PDF files are not supported. Please export a single page as JPG or PNG."
+        )
+    if b"<svg" in file_bytes[:256].lower():
+        raise UnsupportedImageError(
+            "SVG files are not supported. Please use a raster image format."
+        )
+    if len(file_bytes) > 132 and file_bytes[128:132] == b"DICM":
+        raise UnsupportedImageError(
+            "DICOM files are not supported in this version. "
+            "Please export the image as JPG or PNG."
+        )
+
+    try:
+        img = Image.open(io.BytesIO(file_bytes))
+        img.load()
+    except Image.DecompressionBombError:
+        raise UnsupportedImageError(
+            "Image exceeds the 50-megapixel limit. Please resize before uploading."
+        )
+    except Exception as exc:
+        raise UnsupportedImageError(
+            "Could not decode this file as a supported image format."
+        ) from exc
+
+    if img.format == "GIF" and getattr(img, "is_animated", False):
+        raise UnsupportedImageError(
+            "Animated GIF files are not supported. Please use a still image."
+        )
+
+    multi_page_warning = None
+    n_frames = getattr(img, "n_frames", 1)
+    if n_frames > 1 and img.format == "TIFF":
+        img.seek(0)
+        multi_page_warning = (
+            f"Multi-page TIFF detected ({n_frames} pages). Using page 1 only."
+        )
+
+    return img, multi_page_warning
 
 
 def pil_to_model_input(pil_image, size):
@@ -92,20 +159,25 @@ def main():
 
     file = st.file_uploader(
         "Upload a close-up photograph of the lesion",
-        type=["jpg", "jpeg", "png"],
-        help="Without cheek retractors, teeth, or mouth mirrors if possible",
+        type=SUPPORTED_UPLOAD_TYPES,
+        help=(
+            "Accepted: JPEG, PNG, BMP, TIFF, WebP, HEIC/HEIF, AVIF. Max 50 MB. "
+            "Close-up without cheek retractors, teeth, or mouth mirrors if possible."
+        ),
     )
 
     if file is None:
-        st.info("Upload a JPG or PNG to get started.")
+        st.info("Upload an image to get started.")
         return
 
     try:
-        image = Image.open(io.BytesIO(file.getvalue()))
-        image.load()
-    except Exception:
-        st.error("Could not read this file as an image. Please upload a valid JPG or PNG.")
+        image, multi_page_warning = decode_uploaded_image(file.getvalue())
+    except UnsupportedImageError as exc:
+        st.error(str(exc))
         return
+
+    if multi_page_warning:
+        st.warning(multi_page_warning)
 
     try:
         with st.spinner("Analyzing image..."):
