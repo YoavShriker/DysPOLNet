@@ -1,6 +1,5 @@
 import io
 import os
-import pickle
 
 import keras
 import matplotlib as mpl
@@ -11,19 +10,25 @@ from PIL import Image, ImageOps
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.environ.get("DYSPOLNET_MODEL", os.path.join(HERE, "..", "DysPOLNet.hdf5"))
-LR_PATH = os.environ.get("DYSPOLNET_LR", os.path.join(HERE, "..", "lr"))
 IMG_SIZE = (300, 300)
+
+# Platt scaling coefficients extracted from the original `lr` pickle
+# (LogisticRegression: coef_=4.14699105, intercept_=-2.96500325).
+# Inlined to remove the pickle dependency and the sklearn import.
+PLATT_COEF = 4.14699105
+PLATT_INTERCEPT = -2.96500325
+
+
+def platt_calibrate(raw_score):
+    return 1.0 / (1.0 + np.exp(-(PLATT_COEF * raw_score + PLATT_INTERCEPT)))
 
 
 @st.cache_resource
 def load_model():
-    return tf.keras.models.load_model(MODEL_PATH)
-
-
-@st.cache_resource
-def load_platt():
-    with open(LR_PATH, "rb") as fh:
-        return pickle.load(fh)
+    model = tf.keras.models.load_model(MODEL_PATH)
+    # Warm up so the first user request doesn't pay the graph-tracing cost.
+    model.predict(np.zeros((1, *IMG_SIZE, 3), dtype=np.float32), verbose=0)
+    return model
 
 
 @st.cache_resource
@@ -36,7 +41,6 @@ def find_gap_layer_name(_model):
 
 def pil_to_model_input(pil_image, size):
     img = ImageOps.exif_transpose(pil_image).convert("RGB")
-    # keras.utils.load_img defaults to NEAREST; match it to preserve original deployment behavior.
     img = img.resize(size, Image.NEAREST)
     return np.expand_dims(np.asarray(img, dtype=np.float32), axis=0)
 
@@ -72,7 +76,6 @@ def overlay_gradcam(pil_image, heatmap, alpha=0.4):
 
 
 model = load_model()
-platt = load_platt()
 gap_layer_name = find_gap_layer_name(model)
 
 st.write(
@@ -91,15 +94,25 @@ file = st.file_uploader(
 if file is None:
     st.text("Please upload an image file in jpg or png format")
 else:
-    image = Image.open(io.BytesIO(file.getvalue()))
+    try:
+        image = Image.open(io.BytesIO(file.getvalue()))
+        image.load()
+    except Exception:
+        st.error("Could not read this file as an image. Please upload a valid JPG or PNG.")
+        st.stop()
+
     st.image(image, use_container_width=True)
     st.caption("_Image Uploaded by_ USER")
 
-    img_array = pil_to_model_input(image, IMG_SIZE)
-    raw_score = float(np.asarray(model.predict(img_array)).squeeze())
-    calibrated = float(
-        platt.predict_proba(np.asarray([[raw_score]]))[:, 1].squeeze()
-    )
+    try:
+        with st.spinner("Analyzing image..."):
+            img_array = pil_to_model_input(image, IMG_SIZE)
+            raw_score = float(np.asarray(model.predict(img_array, verbose=0)).squeeze())
+            calibrated = float(platt_calibrate(raw_score))
+    except Exception:
+        st.error("The model could not process this image. Please try a different photo.")
+        st.stop()
+
     prediction = format(calibrated, ".1%")
 
     st.markdown("###")
@@ -119,12 +132,16 @@ else:
     )
     st.write("--")
     st.write("Explainability Heatmap:")
-    heatmap = make_gradcam_heatmap(img_array, model, gap_layer_name)
-    overlay = overlay_gradcam(image, heatmap)
-    st.image(overlay, use_container_width=True)
-    st.caption(
-        "_GradCAM heatmap showing region(s) influencing :blue[DysPOLNet’s] prediction_"
-    )
+    try:
+        with st.spinner("Generating explainability heatmap..."):
+            heatmap = make_gradcam_heatmap(img_array, model, gap_layer_name)
+            overlay = overlay_gradcam(image, heatmap)
+        st.image(overlay, use_container_width=True)
+        st.caption(
+            "_GradCAM heatmap showing region(s) influencing :blue[DysPOLNet’s] prediction_"
+        )
+    except Exception:
+        st.warning("Heatmap could not be generated for this image.")
     st.markdown("####")
     st.markdown("####")
     st.markdown("####")
