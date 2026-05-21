@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
-from PIL import Image, ImageOps
+from PIL import ImageOps
 
 GATE_PASS_THRESHOLD = 0.55
 GATE_BLOCK_THRESHOLD = 0.35

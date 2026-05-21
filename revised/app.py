@@ -107,6 +107,15 @@ def decode_uploaded_image(file_bytes):
             f"Multi-page TIFF detected ({n_frames} pages). Using page 1 only."
         )
 
+    # Bake EXIF orientation here so every downstream consumer (gate, model,
+    # cropping, display) works in a single, consistent coordinate system.
+    # Without this, the mouth_bbox returned by the gate would be in the
+    # transposed coordinate space and image.crop() would slice the wrong
+    # region from a phone photo with an orientation tag.
+    original_format = img.format
+    img = ImageOps.exif_transpose(img)
+    img.format = original_format
+
     return img, multi_page_warning
 
 
@@ -235,17 +244,23 @@ def load_clip_bundle():
     return build_clip_bundle()
 
 
+@st.cache_data(show_spinner=False, max_entries=10)
+def cached_decode_and_gate(file_bytes, _face_mesh, _clip_bundle):
+    image, multi_page_warning = decode_uploaded_image(file_bytes)
+    gate_result = evaluate_gate(
+        image,
+        face_detector_fn=lambda im: detect_face_and_mouth(im, _face_mesh),
+        clip_score_fn=lambda im: clip_oral_probability(im, _clip_bundle),
+    )
+    return image, gate_result, multi_page_warning
+
+
 def main():
     st.set_page_config(
         page_title="DysPOLNet",
         layout="centered",
         page_icon=":microscope:",
     )
-
-    model = load_model()
-    gap_layer_name = find_gap_layer_name(model)
-    face_mesh = load_face_mesh()
-    clip_bundle = load_clip_bundle()
 
     st.title("DysPOLNet")
     st.caption(
@@ -266,8 +281,18 @@ def main():
         st.info("Upload an image to get started.")
         return
 
+    # Defer heavy model loads until a file is actually uploaded so the first
+    # page load doesn't block on the ~150 MB CLIP weight download.
+    model = load_model()
+    gap_layer_name = find_gap_layer_name(model)
+    face_mesh = load_face_mesh()
+    clip_bundle = load_clip_bundle()
+
     try:
-        image, multi_page_warning = decode_uploaded_image(file.getvalue())
+        with st.spinner("Checking that this is a close-up of the oral cavity..."):
+            image, gate_result, multi_page_warning = cached_decode_and_gate(
+                file.getvalue(), face_mesh, clip_bundle
+            )
     except UnsupportedImageError as exc:
         st.error(str(exc))
         return
@@ -275,19 +300,18 @@ def main():
     if multi_page_warning:
         st.warning(multi_page_warning)
 
-    with st.spinner("Checking that this is a close-up of the oral cavity..."):
-        gate_result = evaluate_gate(
-            image,
-            face_detector_fn=lambda im: detect_face_and_mouth(im, face_mesh),
-            clip_score_fn=lambda im: clip_oral_probability(im, clip_bundle),
-        )
-
     if gate_result.crop_box is not None:
         image = image.crop(gate_result.crop_box)
-        st.info(
-            "Image auto-cropped to mouth region. For best results, upload "
-            "close-up photographs of the lesion."
-        )
+        if min(image.size) < 100:
+            st.warning(
+                f"Auto-cropped region is small ({image.size[0]}×{image.size[1]} px); "
+                "the prediction may be unreliable. Consider uploading a closer photograph."
+            )
+        else:
+            st.info(
+                "Image auto-cropped to mouth region. For best results, upload "
+                "close-up photographs of the lesion."
+            )
 
     if gate_result.decision == "block":
         st.error(

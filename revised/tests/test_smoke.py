@@ -141,6 +141,22 @@ def test_decode_accepts_bmp_and_tiff_and_webp():
         assert warn is None
 
 
+def test_decode_bakes_exif_rotation_into_pixels():
+    import io
+    from PIL import Image
+    buf = io.BytesIO()
+    wide = Image.new("RGB", (200, 100), (180, 60, 60))
+    exif = wide.getexif()
+    exif[0x0112] = 6  # Orientation tag: rotate 90 CW
+    wide.save(buf, format="JPEG", exif=exif)
+    decoded, _ = decode_uploaded_image(buf.getvalue())
+    # After baking the EXIF orientation, a 200x100 wide image with tag=6
+    # becomes a 100x200 tall image.
+    assert decoded.size == (100, 200)
+    # And the format attribute survives the transpose.
+    assert decoded.format == "JPEG"
+
+
 def test_decode_multipage_tiff_uses_first_page_with_warning():
     import io
     from PIL import Image
