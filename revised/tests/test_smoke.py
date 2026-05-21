@@ -206,3 +206,117 @@ def test_draw_boxes_preserves_image_size_and_no_op_on_empty():
     assert out_empty.size == img.size
     out = draw_boxes_on_image(img, [(20, 30, 50, 40, 0.7)])
     assert out.size == img.size
+
+
+from gate import (  # noqa: E402
+    FACE_CROP_MOUTH_AREA_THRESHOLD,
+    GATE_BLOCK_THRESHOLD,
+    GATE_PASS_THRESHOLD,
+    crop_box_around_mouth,
+    decide_from_p_oral,
+    evaluate_gate,
+)
+
+
+def test_decide_from_p_oral_thresholds():
+    assert decide_from_p_oral(GATE_PASS_THRESHOLD) == "pass"
+    assert decide_from_p_oral(GATE_PASS_THRESHOLD + 0.01) == "pass"
+    assert decide_from_p_oral((GATE_PASS_THRESHOLD + GATE_BLOCK_THRESHOLD) / 2) == "warn"
+    assert decide_from_p_oral(GATE_BLOCK_THRESHOLD) == "warn"
+    assert decide_from_p_oral(GATE_BLOCK_THRESHOLD - 0.01) == "block"
+    assert decide_from_p_oral(0.0) == "block"
+    assert decide_from_p_oral(1.0) == "pass"
+
+
+def test_crop_box_around_mouth_stays_in_bounds():
+    img_size = (640, 480)
+    mouth_bbox = (300, 220, 360, 260)
+    left, top, right, bot = crop_box_around_mouth(img_size, mouth_bbox)
+    assert 0 <= left < right <= 640
+    assert 0 <= top < bot <= 480
+
+
+def test_crop_box_clamps_when_mouth_near_edge():
+    img_size = (200, 200)
+    mouth_bbox = (0, 0, 60, 50)
+    left, top, right, bot = crop_box_around_mouth(img_size, mouth_bbox)
+    assert left == 0 and top == 0
+    assert right <= 200 and bot <= 200
+
+
+def test_gate_passes_when_face_with_large_mouth():
+    from PIL import Image
+    fake_image = Image.new("RGB", (300, 300), (200, 100, 100))
+
+    def fake_face_detector(_):
+        return {
+            "img_size": (300, 300),
+            "mouth_bbox": (50, 50, 250, 250),
+            "mouth_area_frac": FACE_CROP_MOUTH_AREA_THRESHOLD + 0.1,
+        }
+
+    def fake_clip(_):
+        raise AssertionError("CLIP should not be invoked when face fills frame")
+
+    result = evaluate_gate(fake_image, fake_face_detector, fake_clip)
+    assert result.decision == "pass"
+    assert result.method == "face_close_up"
+    assert result.face_detected is True
+    assert result.crop_box is None
+
+
+def test_gate_warns_and_crops_when_small_mouth():
+    from PIL import Image
+    fake_image = Image.new("RGB", (400, 400), (180, 120, 110))
+
+    def fake_face_detector(_):
+        return {
+            "img_size": (400, 400),
+            "mouth_bbox": (180, 220, 220, 240),
+            "mouth_area_frac": 0.01,
+        }
+
+    def fake_clip(_):
+        raise AssertionError("CLIP should not be invoked when face was found")
+
+    result = evaluate_gate(fake_image, fake_face_detector, fake_clip)
+    assert result.decision == "warn"
+    assert result.method == "face_crop"
+    assert result.crop_box is not None
+    left, top, right, bot = result.crop_box
+    assert 0 <= left < right <= 400
+    assert 0 <= top < bot <= 400
+
+
+def test_gate_falls_back_to_clip_when_no_face():
+    from PIL import Image
+    fake_image = Image.new("RGB", (300, 300), (100, 100, 100))
+
+    def fake_face_detector(_):
+        return None
+
+    for p_oral, expected in [(0.9, "pass"), (0.45, "warn"), (0.10, "block")]:
+        result = evaluate_gate(fake_image, fake_face_detector, lambda _, p=p_oral: p)
+        assert result.method == "clip"
+        assert result.face_detected is False
+        assert result.decision == expected
+        assert abs(result.p_oral - p_oral) < 1e-6
+
+
+@pytest.mark.skipif(
+    os.getenv("SKIP_HEAVY_TESTS") == "1",
+    reason="CLIP / MediaPipe integration; requires internet for first-run weight download",
+)
+def test_face_mesh_and_clip_load_and_run():
+    from PIL import Image
+    from gate import build_face_mesh, build_clip_bundle, clip_oral_probability, detect_face_and_mouth
+    try:
+        fm = build_face_mesh()
+        clip_bundle = build_clip_bundle()
+    except Exception as exc:
+        pytest.skip(f"Could not load gate dependencies: {exc}")
+    img = Image.new("RGB", (224, 224), (150, 90, 80))
+    face = detect_face_and_mouth(img, fm)
+    assert face is None
+    p = clip_oral_probability(img, clip_bundle)
+    assert 0.0 <= p <= 1.0

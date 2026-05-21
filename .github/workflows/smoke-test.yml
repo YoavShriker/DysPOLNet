@@ -29,4 +29,6 @@ jobs:
           pip install -r revised/requirements.txt pytest
 
       - name: Verify the trained model loads and predicts as expected
+        env:
+          SKIP_HEAVY_TESTS: "1"
         run: pytest revised/tests/ -v

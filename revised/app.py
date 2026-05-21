@@ -9,6 +9,15 @@ import streamlit as st
 import tensorflow as tf
 from PIL import Image, ImageDraw, ImageOps
 
+from gate import (
+    GATE_BLOCK_THRESHOLD,
+    GATE_PASS_THRESHOLD,
+    build_clip_bundle,
+    build_face_mesh,
+    clip_oral_probability,
+    detect_face_and_mouth,
+    evaluate_gate,
+)
 from pillow_heif import register_heif_opener
 
 register_heif_opener()
@@ -216,6 +225,16 @@ def find_gap_layer_name(_model):
     raise ValueError("No GlobalAveragePooling2D layer found in model")
 
 
+@st.cache_resource
+def load_face_mesh():
+    return build_face_mesh()
+
+
+@st.cache_resource
+def load_clip_bundle():
+    return build_clip_bundle()
+
+
 def main():
     st.set_page_config(
         page_title="DysPOLNet",
@@ -225,6 +244,8 @@ def main():
 
     model = load_model()
     gap_layer_name = find_gap_layer_name(model)
+    face_mesh = load_face_mesh()
+    clip_bundle = load_clip_bundle()
 
     st.title("DysPOLNet")
     st.caption(
@@ -253,6 +274,40 @@ def main():
 
     if multi_page_warning:
         st.warning(multi_page_warning)
+
+    with st.spinner("Checking that this is a close-up of the oral cavity..."):
+        gate_result = evaluate_gate(
+            image,
+            face_detector_fn=lambda im: detect_face_and_mouth(im, face_mesh),
+            clip_score_fn=lambda im: clip_oral_probability(im, clip_bundle),
+        )
+
+    if gate_result.crop_box is not None:
+        image = image.crop(gate_result.crop_box)
+        st.info(
+            "Image auto-cropped to mouth region. For best results, upload "
+            "close-up photographs of the lesion."
+        )
+
+    if gate_result.decision == "block":
+        st.error(
+            "This image does not appear to show the inside of an oral cavity "
+            f"(content match: {gate_result.p_oral:.0%}). DysPOLNet is trained "
+            "on intraoral photographs of leukoplakia; results on other content "
+            "will not be meaningful."
+        )
+        override = st.checkbox(
+            "Analyze anyway — I understand the result may be unreliable",
+            key="gate_override",
+        )
+        if not override:
+            return
+    elif gate_result.decision == "warn":
+        st.warning(
+            f"Image content match to an oral cavity is moderate "
+            f"({gate_result.p_oral:.0%}). The prediction may be less reliable "
+            "than on a clear close-up."
+        )
 
     try:
         with st.spinner("Analyzing image..."):
@@ -321,6 +376,17 @@ def main():
         st.write(f"**Raw model score:** `{raw_score:.4f}`")
         st.write(f"**Calibrated probability:** `{calibrated:.4f}`")
         st.write(f"**Operating threshold:** `{OPERATING_THRESHOLD:.0%}`")
+        st.write("---")
+        st.write("**Oral-cavity gate**")
+        st.write(f"- Method: `{gate_result.method}`")
+        st.write(f"- Decision: `{gate_result.decision}`")
+        st.write(f"- Content match (p_oral): `{gate_result.p_oral:.3f}`")
+        st.write(
+            f"- Pass / block thresholds: "
+            f"`{GATE_PASS_THRESHOLD:.2f}` / `{GATE_BLOCK_THRESHOLD:.2f}`"
+        )
+        if gate_result.crop_box is not None:
+            st.write(f"- Auto-crop box: `{gate_result.crop_box}`")
 
     st.divider()
     st.caption(
