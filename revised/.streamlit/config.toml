@@ -1,0 +1,11 @@
+[theme]
+base = "light"
+primaryColor = "#0E7C7B"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F7F8"
+textColor = "#1A1A1A"
+font = "Inter"
+baseRadius = "medium"
+
+[server]
+maxUploadSize = 50

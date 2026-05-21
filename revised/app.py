@@ -11,32 +11,16 @@ from PIL import Image, ImageOps
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.environ.get("DYSPOLNET_MODEL", os.path.join(HERE, "..", "DysPOLNet.hdf5"))
 IMG_SIZE = (300, 300)
+OPERATING_THRESHOLD = 0.10
 
-# Platt scaling coefficients extracted from the original `lr` pickle
+# Platt scaling coefficients from the original `lr` pickle
 # (LogisticRegression: coef_=4.14699105, intercept_=-2.96500325).
-# Inlined to remove the pickle dependency and the sklearn import.
 PLATT_COEF = 4.14699105
 PLATT_INTERCEPT = -2.96500325
 
 
 def platt_calibrate(raw_score):
     return 1.0 / (1.0 + np.exp(-(PLATT_COEF * raw_score + PLATT_INTERCEPT)))
-
-
-@st.cache_resource
-def load_model():
-    model = tf.keras.models.load_model(MODEL_PATH)
-    # Warm up so the first user request doesn't pay the graph-tracing cost.
-    model.predict(np.zeros((1, *IMG_SIZE, 3), dtype=np.float32), verbose=0)
-    return model
-
-
-@st.cache_resource
-def find_gap_layer_name(_model):
-    for layer in _model.layers:
-        if isinstance(layer, keras.layers.GlobalAveragePooling2D):
-            return layer.name
-    raise ValueError("No GlobalAveragePooling2D layer found in model")
 
 
 def pil_to_model_input(pil_image, size):
@@ -75,34 +59,53 @@ def overlay_gradcam(pil_image, heatmap, alpha=0.4):
     return Image.fromarray(overlay.astype(np.uint8))
 
 
-model = load_model()
-gap_layer_name = find_gap_layer_name(model)
+@st.cache_resource
+def load_model():
+    model = tf.keras.models.load_model(MODEL_PATH)
+    model.predict(np.zeros((1, *IMG_SIZE, 3), dtype=np.float32), verbose=0)
+    return model
 
-st.write(
-    """
-         # Predict Probability of Dysplasia in Oral Leukoplakia
-         """
-)
-st.write(
-    "Simple deployment of the ***:blue[DysPOLNet]*** model to predict dysplasia using lesion photographs"
-)
-file = st.file_uploader(
-    "Please upload a close-up image file of the lesion without cheek retractors, teeth, or mouth mirrors if possible",
-    type=["jpg", "png"],
-)
 
-if file is None:
-    st.text("Please upload an image file in jpg or png format")
-else:
+@st.cache_resource
+def find_gap_layer_name(_model):
+    for layer in _model.layers:
+        if isinstance(layer, keras.layers.GlobalAveragePooling2D):
+            return layer.name
+    raise ValueError("No GlobalAveragePooling2D layer found in model")
+
+
+def main():
+    st.set_page_config(
+        page_title="DysPOLNet",
+        layout="centered",
+        page_icon=":microscope:",
+    )
+
+    model = load_model()
+    gap_layer_name = find_gap_layer_name(model)
+
+    st.title("DysPOLNet")
+    st.caption(
+        "Dysplasia risk estimation for oral leukoplakia photographs. "
+        "Research use only — not a diagnostic device."
+    )
+
+    file = st.file_uploader(
+        "Upload a close-up photograph of the lesion",
+        type=["jpg", "jpeg", "png"],
+        help="Without cheek retractors, teeth, or mouth mirrors if possible",
+    )
+
+    if file is None:
+        st.info("Upload a JPG or PNG to get started.")
+        return
+
     try:
         image = Image.open(io.BytesIO(file.getvalue()))
         image.load()
     except Exception:
         st.error("Could not read this file as an image. Please upload a valid JPG or PNG.")
-        st.stop()
-
-    st.image(image, use_container_width=True)
-    st.caption("_Image Uploaded by_ USER")
+        return
 
     try:
         with st.spinner("Analyzing image..."):
@@ -111,42 +114,60 @@ else:
             calibrated = float(platt_calibrate(raw_score))
     except Exception:
         st.error("The model could not process this image. Please try a different photo.")
-        st.stop()
+        return
 
-    prediction = format(calibrated, ".1%")
+    above_threshold = calibrated >= OPERATING_THRESHOLD
 
-    st.markdown("###")
-    st.subheader("**MODEL OUTPUTS**")
-    st.write("--")
-    st.write("Predicted probability of Dysplasia:", prediction)
+    with st.container(border=True):
+        col_img, col_result = st.columns([1, 1], gap="large")
+        with col_img:
+            st.image(image, use_container_width=True)
+            st.caption("Uploaded image")
+        with col_result:
+            st.metric(
+                label="Dysplasia probability",
+                value=format(calibrated, ".1%"),
+                help=(
+                    f"Operating threshold: {OPERATING_THRESHOLD:.0%} "
+                    "(sensitivity >95% during model development)"
+                ),
+            )
+            st.progress(min(max(calibrated, 0.0), 1.0))
+            if above_threshold:
+                st.markdown("**:red[HIGH RISK]** — above operating point")
+            else:
+                st.markdown("**:green[LOW RISK]** — below operating point")
+            st.caption("The probability is more informative than the binary status.")
+
+    tab_explain, tab_details = st.tabs(["Explainability", "Model details"])
+
+    with tab_explain:
+        try:
+            with st.spinner("Generating explainability heatmap..."):
+                heatmap = make_gradcam_heatmap(img_array, model, gap_layer_name)
+                overlay = overlay_gradcam(image, heatmap)
+            st.image(overlay, use_container_width=True)
+            st.caption(
+                "Grad-CAM: regions influencing the prediction. "
+                "Intensity reflects relative model attention, not lesion severity."
+            )
+        except Exception:
+            st.warning("Heatmap could not be generated for this image.")
+
+    with tab_details:
+        st.write("**Architecture:** EfficientNetB2, 300×300 input, single sigmoid output")
+        st.write("**Calibration:** Platt scaling on validation predictions")
+        st.write(f"**Raw model score:** `{raw_score:.4f}`")
+        st.write(f"**Calibrated probability:** `{calibrated:.4f}`")
+        st.write(f"**Operating threshold:** `{OPERATING_THRESHOLD:.0%}`")
+
+    st.divider()
     st.caption(
-        "(Predicted probability with sensitivity above 95% during model development is **:orange[10%]**)"
+        "DysPOLNet • "
+        "[Oral Cancer Research Theme, HKU](https://facdent.hku.hk/research/oral-cancer.html) • "
+        "Research use only"
     )
-    st.write("--")
-    if raw_score < 0.5:
-        st.write("Suggested Binary Dysplasia Status:", "**:green[LOW RISK]**")
-    else:
-        st.write("Suggested Binary Dysplasia Status:", "**:red[HIGH RISK]**")
-    st.caption(
-        "Please note that the *Predicted Probability* is more informative than *Binary Status*"
-    )
-    st.write("--")
-    st.write("Explainability Heatmap:")
-    try:
-        with st.spinner("Generating explainability heatmap..."):
-            heatmap = make_gradcam_heatmap(img_array, model, gap_layer_name)
-            overlay = overlay_gradcam(image, heatmap)
-        st.image(overlay, use_container_width=True)
-        st.caption(
-            "_GradCAM heatmap showing region(s) influencing :blue[DysPOLNet’s] prediction_"
-        )
-    except Exception:
-        st.warning("Heatmap could not be generated for this image.")
-    st.markdown("####")
-    st.markdown("####")
-    st.markdown("####")
-    st.markdown("####")
-    st.markdown("####")
-    st.write(
-        "Group Website: [Oral Cancer Research Theme, HKU](https://facdent.hku.hk/research/oral-cancer.html)  |  2024"
-    )
+
+
+if __name__ == "__main__":
+    main()
