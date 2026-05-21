@@ -4,9 +4,10 @@ import os
 import keras
 import matplotlib as mpl
 import numpy as np
+import scipy.ndimage
 import streamlit as st
 import tensorflow as tf
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageOps
 
 from pillow_heif import register_heif_opener
 
@@ -30,6 +31,16 @@ SUPPORTED_UPLOAD_TYPES = [
     "tif", "tiff", "webp",
     "heic", "heif", "avif",
 ]
+
+# Bounding-box rendering for suspicious regions.
+# Orange chosen over the colonoscopy-standard lime green because dysplasia
+# is a "warning" finding, not a "go" signal.
+BOX_COLOR = (255, 140, 0)
+BOX_PERCENTILE = 85
+BOX_RELATIVE_FLOOR = 0.2
+BOX_MIN_AREA_FRAC = 0.01
+BOX_MAX = 3
+HEATMAP_ALPHA_WITH_BOXES = 0.25
 
 # Platt scaling coefficients from the original `lr` pickle
 # (LogisticRegression: coef_=4.14699105, intercept_=-2.96500325).
@@ -111,6 +122,70 @@ def make_gradcam_heatmap(img_array, model, gap_layer_name):
     heatmap = tf.squeeze(heatmap)
     heatmap = tf.maximum(heatmap, 0) / (tf.math.reduce_max(heatmap) + 1e-10)
     return heatmap.numpy()
+
+
+def upsample_heatmap_to_image(heatmap_small, target_pil_image):
+    target_w, target_h = ImageOps.exif_transpose(target_pil_image).size
+    h_img = Image.fromarray(
+        np.clip(heatmap_small * 255, 0, 255).astype(np.uint8), mode="L"
+    )
+    h_img = h_img.resize((target_w, target_h), Image.BILINEAR)
+    return np.asarray(h_img, dtype=np.float32) / 255.0
+
+
+def heatmap_to_boxes(
+    heatmap_full,
+    global_p,
+    percentile=BOX_PERCENTILE,
+    relative_floor=BOX_RELATIVE_FLOOR,
+    min_area_frac=BOX_MIN_AREA_FRAC,
+    max_boxes=BOX_MAX,
+):
+    H, W = heatmap_full.shape
+    sigma = max(1.0, 0.02 * H)
+    smoothed = scipy.ndimage.gaussian_filter(heatmap_full, sigma=sigma)
+
+    peak = float(smoothed.max())
+    if peak <= 1e-6:
+        return []
+
+    tau = max(np.percentile(smoothed, percentile), relative_floor * peak)
+    binmask = smoothed >= tau
+    binmask = scipy.ndimage.binary_closing(binmask, iterations=2)
+
+    labels, n_components = scipy.ndimage.label(binmask)
+    if n_components == 0:
+        return []
+
+    slices = scipy.ndimage.find_objects(labels)
+    min_area = min_area_frac * H * W
+    boxes = []
+    for i, sl in enumerate(slices, start=1):
+        if sl is None:
+            continue
+        comp_mask = labels[sl] == i
+        area = int(comp_mask.sum())
+        if area < min_area:
+            continue
+        mean_act = float(smoothed[sl][comp_mask].mean())
+        confidence = float(global_p) * (mean_act / peak)
+        y0, y1 = sl[0].start, sl[0].stop
+        x0, x1 = sl[1].start, sl[1].stop
+        boxes.append((int(x0), int(y0), int(x1 - x0), int(y1 - y0), confidence))
+
+    boxes.sort(key=lambda b: -b[4])
+    return boxes[:max_boxes]
+
+
+def draw_boxes_on_image(pil_image, boxes, color=BOX_COLOR):
+    img = pil_image.copy()
+    if not boxes:
+        return img
+    draw = ImageDraw.Draw(img)
+    stroke = max(2, int(0.012 * min(img.size)))
+    for x, y, w, h, _ in boxes:
+        draw.rectangle([x, y, x + w, y + h], outline=color, width=stroke)
+    return img
 
 
 def overlay_gradcam(pil_image, heatmap, alpha=0.4):
@@ -215,16 +290,30 @@ def main():
 
     with tab_explain:
         try:
-            with st.spinner("Generating explainability heatmap..."):
-                heatmap = make_gradcam_heatmap(img_array, model, gap_layer_name)
-                overlay = overlay_gradcam(image, heatmap)
+            with st.spinner("Generating explainability overlay..."):
+                heatmap_small = make_gradcam_heatmap(img_array, model, gap_layer_name)
+                heatmap_full = upsample_heatmap_to_image(heatmap_small, image)
+                boxes = heatmap_to_boxes(heatmap_full, global_p=calibrated)
+                overlay = overlay_gradcam(
+                    image, heatmap_small, alpha=HEATMAP_ALPHA_WITH_BOXES
+                )
+                overlay = draw_boxes_on_image(overlay, boxes)
             st.image(overlay, use_container_width=True)
-            st.caption(
-                "Grad-CAM: regions influencing the prediction. "
-                "Intensity reflects relative model attention, not lesion severity."
-            )
+            box_count = len(boxes)
+            if box_count == 0:
+                st.caption(
+                    "Grad-CAM heatmap shown; no individual region exceeded the "
+                    "detection threshold. Intensity reflects relative model attention."
+                )
+            else:
+                st.caption(
+                    f"Grad-CAM heatmap with {box_count} highlighted "
+                    f"region{'s' if box_count != 1 else ''} (orange). "
+                    "Boxes mark areas of highest model attention; they are not "
+                    "lesion boundaries."
+                )
         except Exception:
-            st.warning("Heatmap could not be generated for this image.")
+            st.warning("Explainability overlay could not be generated for this image.")
 
     with tab_details:
         st.write("**Architecture:** EfficientNetB2, 300×300 input, single sigmoid output")

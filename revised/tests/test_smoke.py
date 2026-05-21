@@ -10,14 +10,18 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
 from app import (  # noqa: E402
+    BOX_MAX,
     PLATT_COEF,
     PLATT_INTERCEPT,
     UnsupportedImageError,
     decode_uploaded_image,
+    draw_boxes_on_image,
     find_gap_layer_name,
+    heatmap_to_boxes,
     make_gradcam_heatmap,
     pil_to_model_input,
     platt_calibrate,
+    upsample_heatmap_to_image,
 )
 
 MODEL_PATH = os.path.join(HERE, "..", "..", "DysPOLNet.hdf5")
@@ -146,3 +150,59 @@ def test_decode_multipage_tiff_uses_first_page_with_warning():
     img, warn = decode_uploaded_image(buf.getvalue())
     assert img.format == "TIFF"
     assert warn is not None and "Multi-page" in warn
+
+
+def test_boxes_empty_on_flat_heatmap():
+    flat = np.zeros((300, 300), dtype=np.float32)
+    assert heatmap_to_boxes(flat, global_p=0.7) == []
+
+
+def test_boxes_detect_single_hotspot():
+    hm = np.zeros((300, 300), dtype=np.float32)
+    hm[100:180, 120:200] = 1.0
+    boxes = heatmap_to_boxes(hm, global_p=0.8)
+    assert len(boxes) >= 1
+    x, y, w, h, conf = boxes[0]
+    # box should overlap the hotspot region
+    assert x < 200 and (x + w) > 100
+    assert y < 180 and (y + h) > 100
+    # confidence is heuristic but bounded by global_p
+    assert 0.0 < conf <= 0.8 + 1e-6
+
+
+def test_boxes_cap_at_max():
+    hm = np.zeros((300, 300), dtype=np.float32)
+    # five well-separated hotspots
+    for cy, cx in [(40, 40), (40, 250), (150, 150), (260, 40), (260, 250)]:
+        hm[cy - 15:cy + 15, cx - 15:cx + 15] = 1.0
+    boxes = heatmap_to_boxes(hm, global_p=0.9)
+    assert len(boxes) <= BOX_MAX
+
+
+def test_boxes_sorted_by_confidence_desc():
+    hm = np.zeros((300, 300), dtype=np.float32)
+    hm[40:80, 40:80] = 0.4  # weaker
+    hm[160:230, 160:230] = 1.0  # stronger
+    boxes = heatmap_to_boxes(hm, global_p=0.9)
+    assert len(boxes) >= 2
+    confs = [b[4] for b in boxes]
+    assert confs == sorted(confs, reverse=True)
+
+
+def test_upsample_heatmap_matches_image_shape():
+    from PIL import Image
+    small = np.random.RandomState(0).rand(10, 10).astype(np.float32)
+    img = Image.new("RGB", (640, 480), (10, 20, 30))
+    full = upsample_heatmap_to_image(small, img)
+    assert full.shape == (480, 640)
+    assert full.dtype == np.float32
+    assert 0.0 <= full.min() and full.max() <= 1.0
+
+
+def test_draw_boxes_preserves_image_size_and_no_op_on_empty():
+    from PIL import Image
+    img = Image.new("RGB", (200, 200), (50, 60, 70))
+    out_empty = draw_boxes_on_image(img, [])
+    assert out_empty.size == img.size
+    out = draw_boxes_on_image(img, [(20, 30, 50, 40, 0.7)])
+    assert out.size == img.size
