@@ -24,7 +24,7 @@ from app import (  # noqa: E402
     upsample_heatmap_to_image,
 )
 
-MODEL_PATH = os.path.join(HERE, "..", "..", "DysPOLNet.hdf5")
+MODEL_PATH = os.path.join(HERE, "..", "DysPOLNet.hdf5")
 
 # Golden values measured against the committed DysPOLNet.hdf5.
 # Any change to model weights, preprocessing, or dependency versions
